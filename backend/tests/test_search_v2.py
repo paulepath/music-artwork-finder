@@ -190,7 +190,8 @@ async def test_search_pipeline_persists_clusters_progress_and_preselection(monke
         query_state.append(("calls", album_calls, fetched_urls))
     assert "tracks ready" in detail
     assert session.status == SearchStatus.review_ready
-    assert session.progress == 1.0
-    assert clusters == 2, query_state
+    assert session.progress == 1.0, query_state
+    assert clusters == 1, query_state
     assert target.selected_album_cluster_id is not None
-    assert target.selected_track_cluster_id is not None
+    assert target.selected_track_cluster_id is None
+    assert target.artwork_role == QueryRole.album

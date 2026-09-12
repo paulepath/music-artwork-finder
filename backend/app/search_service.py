@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from .consensus import CLUSTER_THRESHOLD, fetch_and_hash, hamming_distance
 from .config import get_settings
@@ -71,6 +72,9 @@ def create_search_session(db, tracks: list[Track], *, selection_kind: str,
     db.flush()
     queries: dict[tuple[QueryRole, str], ArtworkQuery] = {}
     overrides = overrides or {}
+    track_plans = []
+    needed_queries: set[tuple[QueryRole, str]] = set()
+
     for track in tracks:
         refresh_track(track)
         override = overrides.get(track.id, {})
@@ -82,37 +86,93 @@ def create_search_session(db, tracks: list[Track], *, selection_kind: str,
         group = db.get(AlbumGroup, track.group_id)
         album_id = (group.musicbrainz_albumid if group else None) or ""
         release_group_id = (group.musicbrainz_releasegroupid if group else None) or ""
+        identified_album = (group.identified_album if group else None) or ""
+        identified_artist = (group.identified_artist if group else None) or ""
+        identified_mbid = (group.identified_mbid if group else None) or ""
+        identified_rgid = (group.identified_release_group_id if group else None) or ""
+
+        search_album_effective = search_album or identified_album
+        search_album_artist_effective = search_album_artist or identified_artist
+        album_id_effective = album_id or identified_mbid
+        release_group_id_effective = release_group_id or identified_rgid
+
         track_key = track.musicbrainz_trackid or "|".join((normalize(search_artist), normalize(search_title)))
-        base = album_base(search_album)
-        album_key = release_group_id or album_id or "|".join((
-            normalize(search_album_artist), base, str(search_year or ""),
-            posixpath.dirname(posixpath.dirname(track.path)),
-        ))
+        base = album_base(search_album_effective)
+        album_key = (f"merge:{group.merged_into_id}" if group is not None and group.merged_into_id
+                     else release_group_id_effective or album_id_effective or "|".join((
+                         normalize(search_album_artist_effective), base, str(search_year or ""),
+                         posixpath.dirname(posixpath.dirname(track.path)),
+                     )))
+        governing = QueryRole.album if (normalize(search_album) or identified_album) else QueryRole.track
+        if governing == QueryRole.album:
+            needed_queries.add((QueryRole.album, album_key))
+        else:
+            needed_queries.add((QueryRole.track, track_key))
+
+        track_plans.append({
+            "track": track,
+            "search_title": search_title,
+            "search_artist": search_artist,
+            "search_album": search_album_effective,
+            "search_album_artist": search_album_artist_effective,
+            "search_year": search_year,
+            "track_key": track_key,
+            "album_key": album_key,
+            "base": base,
+            "album_id": album_id_effective,
+            "release_group_id": release_group_id_effective,
+            "governing": governing,
+        })
+
+    for plan in track_plans:
+        track = plan["track"]
+        track_key = plan["track_key"]
+        album_key = plan["album_key"]
+        search_title = plan["search_title"]
+        search_artist = plan["search_artist"]
+        search_album = plan["search_album"]
+        search_album_artist = plan["search_album_artist"]
+        search_year = plan["search_year"]
+        base = plan["base"]
+        album_id = plan["album_id"]
+        release_group_id = plan["release_group_id"]
+        governing = plan["governing"]
+
         tq = queries.get((QueryRole.track, track_key))
         if tq is None:
+            is_needed = (QueryRole.track, track_key) in needed_queries
             tq = ArtworkQuery(
                 session_id=session.id, role=QueryRole.track, query_key=track_key,
                 artist=search_artist, title=search_title, album=search_album,
                 album_artist=search_album_artist, year=search_year,
                 musicbrainz_id=track.musicbrainz_trackid,
+                status=WorkStatus.queued if is_needed else WorkStatus.ready,
+                progress=0.0 if is_needed else 1.0,
+                message="" if is_needed else "not searched — album artwork governs this track",
             )
             db.add(tq)
             db.flush()
             queries[(QueryRole.track, track_key)] = tq
+
         aq = queries.get((QueryRole.album, album_key))
         if aq is None:
+            is_needed = (QueryRole.album, album_key) in needed_queries
             aq = ArtworkQuery(
                 session_id=session.id, role=QueryRole.album, query_key=album_key,
                 artist=search_album_artist, title=base or search_album,
                 album=search_album, album_artist=search_album_artist, year=search_year,
                 musicbrainz_id=album_id or None, release_group_id=release_group_id or None,
+                status=WorkStatus.queued if is_needed else WorkStatus.ready,
+                progress=0.0 if is_needed else 1.0,
+                message="" if is_needed else "not searched — track artwork governs this track",
             )
             db.add(aq)
             db.flush()
             queries[(QueryRole.album, album_key)] = aq
+
         target = SearchTarget(
             session_id=session.id, track_id=track.id, track_query_id=tq.id,
-            album_query_id=aq.id, fingerprint=fingerprint(track),
+            album_query_id=aq.id, artwork_role=governing, fingerprint=fingerprint(track),
             search_title=search_title, search_artist=search_artist,
             search_album=search_album, search_album_artist=search_album_artist,
         )
@@ -224,15 +284,31 @@ def _persist_observation(query_id: int, candidate, fetched, confidence: float,
 
 
 def _album_meta(db, query: ArtworkQuery) -> GroupMeta:
-    target = db.scalars(select(SearchTarget).where(SearchTarget.album_query_id == query.id).limit(1)).first()
-    track = db.get(Track, target.track_id)
-    group = db.get(AlbumGroup, track.group_id)
+    targets = list(db.scalars(select(SearchTarget).where(SearchTarget.album_query_id == query.id)))
+    track_ids = [t.track_id for t in targets]
+    tracks = list(db.scalars(select(Track).where(Track.id.in_(track_ids)))) if track_ids else []
+    group_ids = {t.group_id for t in tracks if t.group_id is not None}
+    groups = list(db.scalars(
+        select(AlbumGroup).options(selectinload(AlbumGroup.tracks)).where(AlbumGroup.id.in_(group_ids))
+    )) if group_ids else []
+
+    all_paths: set[str] = set()
+    for g in groups:
+        for t in g.tracks:
+            all_paths.add(t.path)
+    if not all_paths and tracks:
+        for t in tracks:
+            all_paths.add(t.path)
+
     return GroupMeta(
-        album=query.title, album_artist=query.album_artist, year=query.year,
-        track_count=group.track_count if group else 0,
-        mbid=query.musicbrainz_id, release_group_id=query.release_group_id,
-        is_compilation=group.is_compilation if group else False,
-        track_paths=tuple(t.path for t in group.tracks) if group else (track.path,),
+        album=query.title,
+        album_artist=query.album_artist,
+        year=query.year,
+        track_count=sum(g.track_count for g in groups) if groups else len(tracks),
+        mbid=query.musicbrainz_id,
+        release_group_id=query.release_group_id,
+        is_compilation=any(g.is_compilation for g in groups),
+        track_paths=tuple(sorted(all_paths)),
     )
 
 
@@ -326,22 +402,36 @@ async def _run_query(client, query_id: int, session_id: int) -> None:
 def _refresh_session_progress(session_id: int) -> None:
     with session_scope() as db:
         session = db.get(SearchSession, session_id)
-        queries = list(db.scalars(select(ArtworkQuery).where(ArtworkQuery.session_id == session_id)))
-        progress = sum(q.progress for q in queries) / max(1, len(queries))
-        for target in db.scalars(select(SearchTarget).where(SearchTarget.session_id == session_id)):
-            tq, aq = db.get(ArtworkQuery, target.track_query_id), db.get(ArtworkQuery, target.album_query_id)
-            target.progress = (tq.progress + aq.progress) / 2
-            if tq.status in _TERMINAL_QUERY and aq.status in _TERMINAL_QUERY:
-                target.status = WorkStatus.failed if tq.status == aq.status == WorkStatus.failed else WorkStatus.ready
+        by_id = {q.id: q for q in db.scalars(select(ArtworkQuery).where(
+            ArtworkQuery.session_id == session_id))}
+        targets = list(db.scalars(select(SearchTarget).where(SearchTarget.session_id == session_id)))
+        # Only the query that actually governs a target is searched; the other role is created
+        # already ``ready`` at 1.0 so the NOT NULL FK stays satisfied. Averaging over every row
+        # would therefore report a session as nearly complete before any search had run.
+        governing_ids = {target.album_query_id if target.artwork_role == QueryRole.album
+                         else target.track_query_id for target in targets}
+        governing = [by_id[qid] for qid in governing_ids if qid in by_id]
+        progress = sum(q.progress for q in governing) / max(1, len(governing))
+        for target in targets:
+            gq = by_id.get(target.album_query_id if target.artwork_role == QueryRole.album
+                           else target.track_query_id)
+            if gq is None:
+                continue
+            target.progress = gq.progress
+            if gq.status in _TERMINAL_QUERY:
+                target.status = WorkStatus.failed if gq.status == WorkStatus.failed else WorkStatus.ready
                 target.stage = "review"
-                for role, q in ((QueryRole.album, aq), (QueryRole.track, tq)):
-                    best = db.scalars(select(ArtworkCluster).where(
-                        ArtworkCluster.query_id == q.id).order_by(ArtworkCluster.score.desc()).limit(1)).first()
-                    if best:
-                        if role == QueryRole.album and target.selected_album_cluster_id is None:
-                            target.selected_album_cluster_id = best.id
-                        if role == QueryRole.track and target.selected_track_cluster_id is None:
-                            target.selected_track_cluster_id = best.id
+                best = db.scalars(select(ArtworkCluster).where(
+                    ArtworkCluster.query_id == gq.id).order_by(ArtworkCluster.score.desc()).limit(1)).first()
+                if best:
+                    if target.artwork_role == QueryRole.album and target.selected_album_cluster_id is None:
+                        target.selected_album_cluster_id = best.id
+                    if target.artwork_role == QueryRole.track and target.selected_track_cluster_id is None:
+                        target.selected_track_cluster_id = best.id
+        # The session factory sets autoflush=False, so the target statuses assigned above are
+        # still pending; without this flush the counters below read the previous state and the
+        # session reports stale completed/failed totals until the next refresh.
+        db.flush()
         session.completed_tracks = db.scalar(select(func.count()).select_from(SearchTarget).where(
             SearchTarget.session_id == session_id, SearchTarget.status == WorkStatus.ready)) or 0
         session.failed_tracks = db.scalar(select(func.count()).select_from(SearchTarget).where(
@@ -421,8 +511,11 @@ def _safe_cover_targets(db, targets: list[SearchTarget]) -> set[int]:
         direct_ids = {track_id for track_id in all_ids
                       if posixpath.dirname(db.get(Track, track_id).path) == directory}
         selected_ids = {target.track_id for target in selected}
-        album_ids = {target.selected_album_cluster_id for target in selected if target.album_approved}
-        if direct_ids == selected_ids and len(album_ids) == 1 and None not in album_ids:
+        cluster_ids = {
+            (target.selected_album_cluster_id if target.artwork_role == QueryRole.album else target.selected_track_cluster_id)
+            for target in selected
+        }
+        if direct_ids == selected_ids and len(cluster_ids) == 1 and None not in cluster_ids:
             safe.add(selected[0].id)
     return safe
 
@@ -436,7 +529,11 @@ def apply_search_session(session_id: int) -> str:
         targets = list(db.scalars(select(SearchTarget).where(
             SearchTarget.session_id == session_id,
             SearchTarget.applied.is_(False),
-            (SearchTarget.album_approved.is_(True)) | (SearchTarget.track_approved.is_(True)),
+            (
+                (SearchTarget.artwork_role == QueryRole.album) & (SearchTarget.album_approved.is_(True))
+            ) | (
+                (SearchTarget.artwork_role == QueryRole.track) & (SearchTarget.track_approved.is_(True))
+            ),
         )))
         cover_targets = _safe_cover_targets(db, targets)
 
@@ -448,20 +545,22 @@ def apply_search_session(session_id: int) -> str:
             try:
                 if fingerprint(track) != target.fingerprint:
                     raise ValueError("track changed after search; search again")
-                album_raw, album_asset = _asset_bytes(db, target.selected_album_cluster_id if target.album_approved else None)
-                track_raw, track_asset = _asset_bytes(db, target.selected_track_cluster_id if target.track_approved else None)
-                if target.album_approved and album_raw is None:
-                    raise ValueError("selected album image cache is missing")
-                if target.track_approved and track_raw is None:
-                    raise ValueError("selected track image cache is missing")
+                cluster_id = (
+                    target.selected_album_cluster_id
+                    if target.artwork_role == QueryRole.album
+                    else target.selected_track_cluster_id
+                )
+                chosen_bytes, chosen_asset = _asset_bytes(db, cluster_id)
+                if chosen_bytes is None:
+                    raise ValueError(f"selected {target.artwork_role.value} image cache is missing")
                 backup, hashes, wrote_cover = apply_track_artwork(
-                    track, album_raw=album_raw, track_raw=track_raw,
-                    replace_album=target.album_approved, replace_track=target.track_approved,
+                    track, album_raw=chosen_bytes, track_raw=None,
+                    replace_album=True, replace_track=True,
                     write_cover_jpg=target.id in cover_targets, backup_key=target.id,
                 )
                 db.add(TrackWriteAudit(
                     session_id=session_id, target_id=target.id, track_id=track.id,
-                    roles=",".join(role for role, approved in (("album", target.album_approved), ("track", target.track_approved)) if approved),
+                    roles=target.artwork_role.value,
                     backup_dir=backup, image_sha256=hashes, wrote_cover_jpg=wrote_cover,
                 ))
                 target.status, target.stage, target.progress, target.applied = WorkStatus.applied, "applied", 1.0, True
@@ -472,7 +571,7 @@ def apply_search_session(session_id: int) -> str:
                 target.status, target.error = WorkStatus.failed, str(exc)[:2000]
                 db.add(TrackWriteAudit(
                     session_id=session_id, target_id=target.id, track_id=track.id,
-                    roles="", ok=False, error=str(exc)[:2000],
+                    roles=target.artwork_role.value, ok=False, error=str(exc)[:2000],
                 ))
                 failed += 1
     with session_scope() as db:

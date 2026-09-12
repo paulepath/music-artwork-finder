@@ -35,12 +35,20 @@ def new_client() -> httpx.AsyncClient:
 
 
 async def get_json(client: httpx.AsyncClient, url: str, **kw) -> dict | list | None:
-    await _throttle(url)
-    r = await client.get(url, **kw)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    return r.json()
+    host = urlsplit(url).hostname or "_default"
+    for attempt in range(3):
+        await _throttle(url)
+        try:
+            r = await client.get(url, **kw)
+            if r.status_code == 404:
+                return None
+            if r.status_code == 503 and attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        finally:
+            _last_hit[host] = time.monotonic()
 
 
 async def get_bytes(client: httpx.AsyncClient, url: str, **kw) -> tuple[bytes, str]:

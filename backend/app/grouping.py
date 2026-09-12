@@ -5,6 +5,7 @@ No DB or filesystem access here so it is trivially unit-testable.
 from __future__ import annotations
 
 import posixpath
+import re
 from dataclasses import dataclass, field
 
 from .matching import normalize
@@ -37,6 +38,26 @@ class ScannedTrack:
         return self.album_artist or self.artist
 
 
+_DISC_TOKEN = re.compile(r"^(?:disc|disk|cd)(\d+)$")
+
+
+def _has_disc_marker(title: str) -> bool:
+    """True if the title carries a disc marker.
+
+    Both spellings occur in the wild and ``normalize`` does not split them apart:
+    ``"Disc 1 - 1685-1730"`` becomes two tokens ``disc``/``1``, but ``"CD1"`` stays a
+    single token ``cd1``. Matching only the spaced form silently misses the bare
+    ``CD1``/``CD2`` titles that flat multi-disc rips most often use.
+    """
+    toks = normalize(title).split()
+    for i, t in enumerate(toks):
+        if _DISC_TOKEN.match(t):
+            return True
+        if t in ("disc", "disk", "cd") and i + 1 < len(toks) and toks[i + 1].isdigit():
+            return True
+    return False
+
+
 def _album_base(title: str) -> str:
     """Album title minus disc markers, so 'Box Disc 1' == 'Box Disc 2'."""
     toks = normalize(title).split()
@@ -56,6 +77,110 @@ def _album_base(title: str) -> str:
 def album_base(title: str) -> str:
     """Public disc-marker normalizer used by track-first album queries."""
     return _album_base(title)
+
+
+def merge_candidate_key(album_artist: str, album: str, common_dir: str) -> str:
+    """Identity of the multi-disc SET a directory might belong to."""
+    ndir = posixpath.normpath((common_dir or "").replace("\\", "/"))
+    parent_dir = posixpath.dirname(ndir) if ndir else ""
+    return "|||".join((normalize(album_artist) or "?", album_base(album) or "?", parent_dir))
+
+
+class MergeBucket(list):
+    def __init__(self, merge_key: str, title: str, album_artist: str, groups: list | None = None):
+        super().__init__(groups or [])
+        self.merge_key = merge_key
+        self.title = title
+        self.album_artist = album_artist
+
+    @property
+    def groups(self) -> list:
+        return list(self)
+
+
+def _get_group_attr(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def suggest_merges(groups) -> list[MergeBucket]:
+    buckets_by_key: dict[str, list] = {}
+    for g in groups:
+        if _get_group_attr(g, "merged_into_id", None) is not None:
+            continue
+        if bool(_get_group_attr(g, "merge_dismissed", False)):
+            continue
+        aa = _get_group_attr(g, "album_artist", "") or _get_group_attr(g, "artist", "") or ""
+        album = _get_group_attr(g, "album", "") or ""
+        cdir = _get_group_attr(g, "common_dir", "") or ""
+        # A merge has to be evidenced by a shared album *title*. Without this guard every
+        # untagged folder collapses onto the "?" sentinel key, and a pile of unrelated rips
+        # sitting under one parent is offered as a single multi-disc set.
+        if not album_base(album):
+            continue
+        key = merge_candidate_key(aa, album, cdir)
+        buckets_by_key.setdefault(key, []).append(g)
+
+    result: list[MergeBucket] = []
+    for key, member_list in buckets_by_key.items():
+        if len(member_list) < 2:
+            continue
+        discs = {_get_group_attr(g, "disc", 1) for g in member_list}
+        dirs = {
+            posixpath.normpath(str(_get_group_attr(g, "common_dir", "") or "").replace("\\", "/"))
+            for g in member_list
+        }
+        if len(discs) < 2 and len(dirs) < 2:
+            continue
+
+        first = member_list[0]
+        title = album_base(_get_group_attr(first, "album", "") or "")
+        album_artist = _get_group_attr(first, "album_artist", "") or _get_group_attr(first, "artist", "") or ""
+        result.append(MergeBucket(merge_key=key, title=title, album_artist=album_artist, groups=member_list))
+
+    # Rule 2: flat-folder multi-disc detection.
+    # Within a single common_dir, two or more groups sharing a normalized album_artist
+    # where EVERY title carries a disc marker form one set. Proposed title defaults
+    # to directory basename.
+    handled = {id(g) for b in result for g in b} | {
+        _get_group_attr(g, "id") for b in result for g in b if _get_group_attr(g, "id") is not None
+    }
+    flat_buckets: dict[tuple[str, str], list] = {}
+    for g in groups:
+        if id(g) in handled or _get_group_attr(g, "id", None) in handled:
+            continue
+        if _get_group_attr(g, "merged_into_id", None) is not None:
+            continue
+        if bool(_get_group_attr(g, "merge_dismissed", False)):
+            continue
+        album = _get_group_attr(g, "album", "") or ""
+        # No album_base() guard here, unlike rule 1. Rule 1 buckets on the base title, so an
+        # empty one collapses every untagged folder onto the "?" sentinel; rule 2 buckets on
+        # (directory, album_artist) and is gated by the disc marker instead — and requiring a
+        # non-empty base would throw away exactly the bare "CD 1"/"Disc 2" titles this rule exists
+        # to catch. An untagged album has no disc marker, so it is still excluded.
+        if not _has_disc_marker(album):
+            continue
+        cdir = _get_group_attr(g, "common_dir", "") or ""
+        ndir = posixpath.normpath(str(cdir).replace("\\", "/")).rstrip("/")
+        if not ndir or ndir in (".", "/"):
+            continue
+        aa = _get_group_attr(g, "album_artist", "") or _get_group_attr(g, "artist", "") or ""
+        naa = normalize(aa)
+        flat_buckets.setdefault((ndir, naa), []).append(g)
+
+    for (ndir, naa), member_list in flat_buckets.items():
+        if len(member_list) < 2:
+            continue
+        first = member_list[0]
+        dir_basename = posixpath.basename(ndir)
+        title = dir_basename or album_base(_get_group_attr(first, "album", "") or "")
+        album_artist = _get_group_attr(first, "album_artist", "") or _get_group_attr(first, "artist", "") or ""
+        key = f"flat:{naa or '?'}|||{ndir}"
+        result.append(MergeBucket(merge_key=key, title=title, album_artist=album_artist, groups=member_list))
+
+    return result
 
 
 def group_key(album_artist: str, album: str, disc: int, directory: str = "") -> str:

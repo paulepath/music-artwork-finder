@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import posixpath
 from pathlib import Path, PurePosixPath
@@ -11,12 +12,13 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import get_session
-from ..dual_writer import read_artwork
+from ..dual_writer import fingerprint, read_artwork, track_path
 from ..models import (
-    ArtworkAsset, ArtworkCluster, ArtworkQuery, CandidateObservation, Job, JobKind,
-    QueryRole, SearchSession, SearchStatus, SearchTarget, Track, TrackWriteAudit,
+    AlbumGroup, ArtworkAsset, ArtworkCluster, ArtworkQuery, CandidateObservation, GroupState,
+    Job, JobKind, QueryRole, SearchSession, SearchStatus, SearchTarget, Track, TrackWriteAudit,
     WorkStatus, utcnow,
 )
+from ..scanner import _easy
 from ..schemas import (
     ApproveRecommendedRequest, LibraryTrackOut, SearchSelectionRequest, SelectionUpdate,
 )
@@ -93,14 +95,34 @@ def library_folders(parent: str = "/"):
 
 
 def _resolve_tracks(db: Session, body: SearchSelectionRequest) -> tuple[list[Track], str, str]:
-    if bool(body.track_ids) == bool(body.folder_path):
-        raise HTTPException(422, "provide either track_ids or folder_path")
+    sources = sum([bool(body.track_ids), bool(body.folder_path), bool(body.album_ids)])
+    if sources != 1:
+        raise HTTPException(422, "provide exactly one of track_ids, folder_path, or album_ids")
     if body.track_ids:
         unique = list(dict.fromkeys(body.track_ids))
         tracks = list(db.scalars(select(Track).where(Track.id.in_(unique))))
         if len(tracks) != len(unique):
             raise HTTPException(404, "one or more tracks were not found")
         return tracks, "tracks", ""
+    if body.album_ids:
+        unique = list(dict.fromkeys(body.album_ids))
+        groups = list(db.scalars(select(AlbumGroup).where(AlbumGroup.id.in_(unique))))
+        if len(groups) != len(unique):
+            raise HTTPException(404, "one or more albums were not found")
+        merged_ids = {g.merged_into_id for g in groups if g.merged_into_id is not None}
+        all_group_ids = {g.id for g in groups}
+        if merged_ids:
+            member_ids = db.scalars(
+                select(AlbumGroup.id).where(AlbumGroup.merged_into_id.in_(merged_ids))
+            ).all()
+            all_group_ids.update(member_ids)
+            groups = list(db.scalars(select(AlbumGroup).where(AlbumGroup.id.in_(all_group_ids))))
+        for g in groups:
+            if not (g.album or "").strip() and not g.identified_album:
+                folder_name = g.common_dir or f"group #{g.id}"
+                raise HTTPException(422, f"cannot search album artwork for untitled folder {folder_name!r}; use track search or identify album first")
+        tracks = list(db.scalars(select(Track).where(Track.group_id.in_(all_group_ids)).order_by(Track.path)))
+        return tracks, "albums", ""
     folder = _virtual_path(body.folder_path)
     prefix = folder.rstrip("/") + "/"
     tracks = list(db.scalars(select(Track).where(Track.path.like(prefix + "%")).order_by(Track.path)))
@@ -175,12 +197,20 @@ def list_sessions(db: Session = Depends(get_session), limit: int = Query(30, le=
 
 
 @router.get("/search-sessions/{session_id}")
-def get_search_session(session_id: int, db: Session = Depends(get_session)):
+def get_search_session(session_id: int, include_targets: bool = True,
+                       db: Session = Depends(get_session)):
+    """Session header, and by default the full target payload.
+
+    The review page polls this once a second alongside ``/albums``; ``_targets`` re-serializes
+    an album's candidate clusters once per member track, so a caller that only needs the header
+    should pass ``include_targets=false`` rather than pulling that payload every tick.
+    """
     session = db.get(SearchSession, session_id)
     if session is None:
         raise HTTPException(404, "search session not found")
     result = _session_dict(session)
-    result["targets"] = _targets(db, session_id)
+    if include_targets:
+        result["targets"] = _targets(db, session_id)
     return result
 
 
@@ -212,29 +242,141 @@ def _clusters(db: Session, query_id: int) -> list[dict]:
     return result
 
 
+def _target_dict(db: Session, target: SearchTarget) -> dict:
+    track = db.get(Track, target.track_id)
+    role = target.artwork_role
+    gq = db.get(ArtworkQuery, target.album_query_id if role == QueryRole.album else target.track_query_id)
+    selected_cluster_id = (
+        target.selected_album_cluster_id if role == QueryRole.album else target.selected_track_cluster_id
+    )
+    approved = target.album_approved if role == QueryRole.album else target.track_approved
+    return {
+        "id": target.id,
+        "track": _track_dict(track),
+        "status": target.status.value,
+        "stage": target.stage,
+        "progress": target.progress,
+        "message": target.message,
+        "error": target.error,
+        "applied": target.applied,
+        "artwork_role": role.value,
+        "selected_cluster_id": selected_cluster_id,
+        "approved": approved,
+        "current_art_url": f"/api/library/tracks/{track.id}/artwork/{role.value}",
+        "search_metadata": {
+            "title": target.search_title,
+            "artist": target.search_artist,
+            "album": target.search_album,
+            "album_artist": target.search_album_artist,
+        },
+        "artwork_query": {
+            "id": gq.id,
+            "status": gq.status.value,
+            "message": gq.message,
+            "google_used": gq.google_used,
+            "clusters": _clusters(db, gq.id),
+        },
+    }
+
+
 def _targets(db: Session, session_id: int) -> list[dict]:
-    result = []
-    for target in db.scalars(select(SearchTarget).where(
-        SearchTarget.session_id == session_id).order_by(SearchTarget.id)):
-        track = db.get(Track, target.track_id)
-        tq, aq = db.get(ArtworkQuery, target.track_query_id), db.get(ArtworkQuery, target.album_query_id)
-        result.append({
-            "id": target.id, "track": _track_dict(track), "status": target.status.value,
-            "stage": target.stage, "progress": target.progress, "message": target.message,
-            "error": target.error, "applied": target.applied,
-            "selected_album_cluster_id": target.selected_album_cluster_id,
-            "selected_track_cluster_id": target.selected_track_cluster_id,
-            "album_approved": target.album_approved, "track_approved": target.track_approved,
-            "current_album_art_url": f"/api/library/tracks/{track.id}/artwork/album",
-            "current_track_art_url": f"/api/library/tracks/{track.id}/artwork/track",
-            "search_metadata": {"title": target.search_title, "artist": target.search_artist,
-                                "album": target.search_album, "album_artist": target.search_album_artist},
-            "album_query": {"id": aq.id, "status": aq.status.value, "message": aq.message,
-                            "google_used": aq.google_used, "clusters": _clusters(db, aq.id)},
-            "track_query": {"id": tq.id, "status": tq.status.value, "message": tq.message,
-                            "google_used": tq.google_used, "clusters": _clusters(db, tq.id)},
+    return [
+        _target_dict(db, target)
+        for target in db.scalars(
+            select(SearchTarget).where(SearchTarget.session_id == session_id).order_by(SearchTarget.id)
+        )
+    ]
+
+
+@router.get("/search-sessions/{session_id}/albums")
+def get_session_albums(session_id: int, db: Session = Depends(get_session)):
+    session = db.get(SearchSession, session_id)
+    if session is None:
+        raise HTTPException(404, "search session not found")
+
+    targets = list(db.scalars(
+        select(SearchTarget).where(SearchTarget.session_id == session_id).order_by(SearchTarget.id)
+    ))
+
+    album_groups: dict[int, list[SearchTarget]] = defaultdict(list)
+    singles: list[dict] = []
+
+    for target in targets:
+        if target.artwork_role == QueryRole.album:
+            album_groups[target.album_query_id].append(target)
+        else:
+            singles.append(_target_dict(db, target))
+
+    albums: list[dict] = []
+    for album_query_id, group_targets in album_groups.items():
+        aq = db.get(ArtworkQuery, album_query_id)
+        tracks_for_album = [db.get(Track, t.track_id) for t in group_targets]
+
+        # ArtworkQuery.title holds album_base(), which is normalized (lower-cased, punctuation
+        # stripped) because it is a lookup key — "Dreams 3" is stored as "dreams 3". Prefer the
+        # track's own album tag for display and keep the query title only as a fallback.
+        title = (tracks_for_album[0].album if tracks_for_album and tracks_for_album[0].album
+                 else aq.title)
+        album_artist = aq.album_artist or (
+            tracks_for_album[0].album_artist or tracks_for_album[0].artist if tracks_for_album else ""
+        )
+        year = aq.year if aq.year is not None else (tracks_for_album[0].year if tracks_for_album else None)
+
+        directories = sorted(list({posixpath.dirname(track.path) for track in tracks_for_album if track}))
+        discs = sorted(list({track.disc for track in tracks_for_album if track}))
+
+        selected_ids = {t.selected_album_cluster_id for t in group_targets}
+        selected_cluster_id = group_targets[0].selected_album_cluster_id if len(selected_ids) == 1 else None
+        approved = all(t.album_approved for t in group_targets) if group_targets else False
+        applied = all(t.applied for t in group_targets) if group_targets else False
+
+        current_art_url = (
+            f"/api/library/tracks/{tracks_for_album[0].id}/artwork/album"
+            if tracks_for_album else ""
+        )
+
+        member_tracks = []
+        for target, track in zip(group_targets, tracks_for_album):
+            member_tracks.append({
+                "target_id": target.id,
+                "track_id": track.id,
+                "title": track.title,
+                "artist": track.artist,
+                "disc": track.disc,
+                "track_no": track.track_no,
+                "path": track.path,
+                "status": target.status.value,
+                "stage": target.stage,
+                "progress": target.progress,
+                "error": target.error,
+                "applied": target.applied,
+            })
+        member_tracks.sort(key=lambda t: (t["disc"], t["track_no"] or 0, t["path"]))
+
+        albums.append({
+            "album_query_id": aq.id,
+            "title": title,
+            "album_artist": album_artist,
+            "year": year,
+            "track_count": len(group_targets),
+            "directories": directories,
+            "discs": discs,
+            "status": aq.status.value,
+            "progress": aq.progress,
+            "message": aq.message,
+            "google_used": aq.google_used,
+            "clusters": _clusters(db, aq.id),
+            "selected_cluster_id": selected_cluster_id,
+            "approved": approved,
+            "applied": applied,
+            "current_art_url": current_art_url,
+            "tracks": member_tracks,
         })
-    return result
+
+    return {
+        "albums": albums,
+        "singles": singles,
+    }
 
 
 @router.get("/library/tracks/{track_id}/artwork/{role}")
@@ -279,38 +421,69 @@ def update_selection(session_id: int, target_id: int, body: SelectionUpdate,
     target = db.get(SearchTarget, target_id)
     if target is None or target.session_id != session_id:
         raise HTTPException(404, "search target not found")
-    for cluster_id, query_id, label in (
-        (body.album_cluster_id, target.album_query_id, "album"),
-        (body.track_cluster_id, target.track_query_id, "track"),
-    ):
-        if cluster_id is not None:
-            cluster = db.get(ArtworkCluster, cluster_id)
-            if cluster is None or cluster.query_id != query_id:
-                raise HTTPException(422, f"{label} cluster does not belong to this track")
-    target.selected_album_cluster_id = body.album_cluster_id
-    target.selected_track_cluster_id = body.track_cluster_id
-    target.album_approved = body.album_approved and body.album_cluster_id is not None
-    target.track_approved = body.track_approved and body.track_cluster_id is not None
+    query_id = target.album_query_id if target.artwork_role == QueryRole.album else target.track_query_id
+    if body.cluster_id is not None:
+        cluster = db.get(ArtworkCluster, body.cluster_id)
+        if cluster is None or cluster.query_id != query_id:
+            raise HTTPException(422, f"{target.artwork_role.value} cluster does not belong to this track")
+    approved = body.approved and body.cluster_id is not None
+    if target.artwork_role == QueryRole.album:
+        target.selected_album_cluster_id = body.cluster_id
+        target.album_approved = approved
+    else:
+        target.selected_track_cluster_id = body.cluster_id
+        target.track_approved = approved
     return {"ok": True}
+
+
+@router.put("/search-sessions/{session_id}/albums/{album_query_id}/selection")
+def update_album_selection(session_id: int, album_query_id: int, body: SelectionUpdate,
+                           db: Session = Depends(get_session)):
+    aq = db.get(ArtworkQuery, album_query_id)
+    if aq is None or aq.session_id != session_id:
+        raise HTTPException(404, "album query not found")
+    if body.cluster_id is not None:
+        cluster = db.get(ArtworkCluster, body.cluster_id)
+        if cluster is None or cluster.query_id != album_query_id:
+            raise HTTPException(422, "cluster does not belong to this album query")
+    targets = list(db.scalars(
+        select(SearchTarget).where(
+            SearchTarget.session_id == session_id,
+            SearchTarget.album_query_id == album_query_id,
+            SearchTarget.artwork_role == QueryRole.album,
+        )
+    ))
+    approved = body.approved and body.cluster_id is not None
+    for target in targets:
+        target.selected_album_cluster_id = body.cluster_id
+        target.album_approved = approved
+    return {"ok": True, "targets_updated": len(targets)}
 
 
 @router.post("/search-sessions/{session_id}/approve-recommended")
 def approve_recommended(session_id: int, body: ApproveRecommendedRequest,
                         db: Session = Depends(get_session)):
+    session = db.get(SearchSession, session_id)
+    if session is None:
+        raise HTTPException(404, "search session not found")
     rank = {"low": 0, "medium": 1, "high": 2}
     if body.minimum_confidence not in rank:
         raise HTTPException(422, "minimum_confidence must be low, medium, or high")
     approved = 0
     for target in db.scalars(select(SearchTarget).where(SearchTarget.session_id == session_id)):
-        for role, cluster_id in (("album", target.selected_album_cluster_id), ("track", target.selected_track_cluster_id)):
-            cluster = db.get(ArtworkCluster, cluster_id) if cluster_id else None
-            ok = cluster is not None and rank[cluster.confidence_label] >= rank[body.minimum_confidence]
-            if role == "album":
-                target.album_approved = ok
-            else:
-                target.track_approved = ok
-            approved += int(ok)
-    return {"approved_roles": approved}
+        cluster_id = (
+            target.selected_album_cluster_id
+            if target.artwork_role == QueryRole.album
+            else target.selected_track_cluster_id
+        )
+        cluster = db.get(ArtworkCluster, cluster_id) if cluster_id else None
+        ok = cluster is not None and rank.get(cluster.confidence_label, -1) >= rank[body.minimum_confidence]
+        if target.artwork_role == QueryRole.album:
+            target.album_approved = ok
+        else:
+            target.track_approved = ok
+        approved += int(ok)
+    return {"approved_targets": approved}
 
 
 @router.post("/search-sessions/{session_id}/{action}")
@@ -334,9 +507,14 @@ def control_session(session_id: int, action: str, db: Session = Depends(get_sess
     elif action == "apply":
         if session.status not in (SearchStatus.review_ready, SearchStatus.done):
             raise HTTPException(409, "session is not ready for review")
+        # Must mirror apply_search_session's own selection exactly: an approval recorded against
+        # the role that does *not* govern a target (stale rows from before artwork_role existed)
+        # would otherwise pass this guard and then apply nothing.
         count = db.scalar(select(func.count()).select_from(SearchTarget).where(
             SearchTarget.session_id == session_id,
-            (SearchTarget.album_approved.is_(True)) | (SearchTarget.track_approved.is_(True)),
+            SearchTarget.applied.is_(False),
+            ((SearchTarget.artwork_role == QueryRole.album) & SearchTarget.album_approved.is_(True))
+            | ((SearchTarget.artwork_role == QueryRole.track) & SearchTarget.track_approved.is_(True)),
         )) or 0
         if count == 0:
             raise HTTPException(422, "no artwork selections are approved")
@@ -365,7 +543,7 @@ def track_audit(db: Session = Depends(get_session), limit: int = Query(100, le=5
 @router.post("/track-audit/{audit_id}/undo")
 def undo_track_audit(audit_id: int, db: Session = Depends(get_session)):
     row = db.get(TrackWriteAudit, audit_id)
-    if row is None or row.action != "apply":
+    if row is None or row.action not in ("apply", "tags"):
         raise HTTPException(404, "write audit not found")
     if row.undone_at:
         return {"restored": 0}
@@ -377,7 +555,31 @@ def undo_track_audit(audit_id: int, db: Session = Depends(get_session)):
         session_id=row.session_id, target_id=row.target_id, track_id=row.track_id,
         action="undo", roles=row.roles, backup_dir=row.backup_dir, ok=True,
     ))
-    target = db.get(SearchTarget, row.target_id)
-    if target:
-        target.applied, target.status, target.stage = False, WorkStatus.ready, "review"
+    if row.action == "apply":
+        if row.target_id:
+            target = db.get(SearchTarget, row.target_id)
+            if target:
+                target.applied, target.status, target.stage = False, WorkStatus.ready, "review"
+    elif row.action == "tags":
+        track = db.get(Track, row.track_id)
+        if track:
+            p = track_path(track)
+            if p.is_file():
+                stat = p.stat()
+                track.file_size = stat.st_size
+                track.mtime_ns = stat.st_mtime_ns
+                info = _easy(p)
+                track.album = info.get("album") or ""
+                track.album_artist = info.get("albumartist") or ""
+                track.artist = info.get("artist") or ""
+                new_fp = fingerprint(track)
+                unapplied_targets = list(db.scalars(
+                    select(SearchTarget).where(
+                        SearchTarget.track_id == track.id,
+                        SearchTarget.applied.is_(False),
+                    )
+                ))
+                for tgt in unapplied_targets:
+                    tgt.fingerprint = new_fp
+    db.commit()
     return {"restored": restored}

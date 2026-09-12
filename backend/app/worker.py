@@ -138,6 +138,10 @@ class Worker:
             await self._do_apply(job_id, payload)
         elif kind == JobKind.ma_sync:
             await self._do_ma_sync(job_id, payload)
+        elif kind == JobKind.search_session:
+            await self._do_search_session(job_id, payload)
+        elif kind == JobKind.apply_session:
+            await self._do_apply_session(job_id, payload)
         else:  # pragma: no cover
             self._finish(job_id, JobStatus.failed, f"unknown job kind {kind}")
 
@@ -330,6 +334,25 @@ class Worker:
         from .ma_sync import trigger_sync
         res = await trigger_sync(payload.get("media_types"))
         self._finish(job_id, JobStatus.done if res.ok else JobStatus.failed, res.detail)
+
+    async def _do_search_session(self, job_id: int, payload: dict) -> None:
+        from .search_service import run_search_session
+        detail = await run_search_session(int(payload["session_id"]))
+        status = JobStatus.cancelled if detail == "cancelled" else JobStatus.done
+        self._finish(job_id, status, detail)
+
+    async def _do_apply_session(self, job_id: int, payload: dict) -> None:
+        from .search_service import apply_search_session
+        loop = asyncio.get_running_loop()
+        detail = await loop.run_in_executor(None, apply_search_session, int(payload["session_id"]))
+        wrote_any = not detail.startswith("applied 0 ")
+        # Music Assistant caches the library's embedded cover art. Queue its
+        # supported music sync after successful writes so the result becomes
+        # visible without requiring a separate dashboard action.
+        if wrote_any:
+            sync_job_id = enqueue(JobKind.ma_sync, payload={"origin": "artwork_apply"})
+            detail = f"{detail}; Music Assistant sync queued (job {sync_job_id})"
+        self._finish(job_id, JobStatus.done if detail.startswith("applied") and "; 0 failed" in detail else JobStatus.failed, detail)
 
 
 worker = Worker()

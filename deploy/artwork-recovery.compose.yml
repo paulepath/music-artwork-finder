@@ -1,6 +1,6 @@
 services:
   artwork-recovery:
-    image: local/artwork-recovery:v2
+    image: local/artwork-recovery:v3.3
     container_name: artwork-recovery
     restart: unless-stopped
     environment:

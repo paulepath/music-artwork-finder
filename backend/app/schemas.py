@@ -14,6 +14,7 @@ class TrackOut(ORM):
     id: int
     path: str
     title: str
+    disc: int = 1
     track_no: int | None
     duration_s: float | None
     has_embedded_art: bool
@@ -77,13 +78,29 @@ class AlbumSummary(ORM):
     updated_at: dt.datetime
     candidate_count: int = 0
     best_tier: str | None = None
+    discs: list[int] = Field(default_factory=list)
+    member_group_ids: list[int] = Field(default_factory=list)
+    is_loose_tracks: bool = False
 
 
 class AlbumDetail(AlbumSummary):
-    musicbrainz_albumid: str | None
+    musicbrainz_albumid: str | None = None
+    musicbrainz_releasegroupid: str | None = None
+    identified_album: str | None = None
+    identified_artist: str | None = None
+    identified_mbid: str | None = None
+    identified_release_group_id: str | None = None
     tracks: list[TrackOut] = []
     candidates: list[CandidateOut] = []
     audit: list[AuditOut] = []
+
+
+class IdentifyApplyRequest(BaseModel):
+    mbid: str | None = None
+    release_group_id: str | None = None
+    album: str
+    artist: str = ""
+    write_tags: bool = True
 
 
 class JobOut(ORM):
@@ -123,6 +140,7 @@ class SearchMetadataOverride(BaseModel):
 
 class SearchSelectionRequest(BaseModel):
     track_ids: list[int] = Field(default_factory=list)
+    album_ids: list[int] = Field(default_factory=list)
     folder_path: str | None = None
     recursive: bool = True
     include_existing: bool = True
@@ -131,11 +149,18 @@ class SearchSelectionRequest(BaseModel):
 
 
 class SelectionUpdate(BaseModel):
-    album_cluster_id: int | None = None
-    track_cluster_id: int | None = None
-    album_approved: bool = False
-    track_approved: bool = False
+    cluster_id: int | None = None
+    approved: bool = False
 
 
 class ApproveRecommendedRequest(BaseModel):
     minimum_confidence: str = "medium"
+
+
+class CreateMergeRequest(BaseModel):
+    group_ids: list[int]
+    title: str | None = None
+
+
+class DismissMergeRequest(BaseModel):
+    group_ids: list[int]

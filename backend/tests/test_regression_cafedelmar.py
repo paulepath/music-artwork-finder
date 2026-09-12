@@ -38,3 +38,25 @@ def test_spanish_volume_title_still_matches_volume_three():
     res = classify(_cafe_group(), correct)
     assert res.rejected is False
     assert res.tier in (Tier.strong, Tier.fuzzy)  # not rejected; human/auto can take it
+
+
+def test_various_artists_tagged_locally_does_not_waive_artist_check():
+    """The 2026-09-12 "Dreams 3" incident: the local file's album_artist tag is
+    literally "Various Artists" (as almost every track in this library is), and a
+    completely unrelated album ("Summer Dreams 3" by "Pop International") shared
+    just enough loose title-token overlap with our generic "Dreams 3" tag to pass
+    as a fuzzy/medium candidate — because classify() used to treat *any* locally
+    "Various Artists"-tagged file as having its artist-match requirement waived
+    outright, regardless of who the candidate was actually by.
+    """
+    local = GroupMeta(
+        album="Dreams 3", album_artist="Various Artists", year=2003,
+        track_count=14, mbid=None, release_group_id=None, is_compilation=True,
+    )
+    unrelated = ReleaseMeta(
+        source="deezer", title="Summer Dreams 3", artist="Pop International",
+        year=2003, track_count=14,
+    )
+    res = classify(local, unrelated)
+    assert res.tier != Tier.strong
+    assert res.confidence < 0.5

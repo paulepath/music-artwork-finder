@@ -6,6 +6,8 @@ import hashlib
 from pathlib import Path
 
 from mutagen import File as MutagenFile
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
@@ -157,24 +159,88 @@ def _write_roles(path: Path, album: bytes | None, track_art: bytes | None,
 
     if suffix in (".m4a", ".mp4", ".m4b"):
         audio = MP4(path)
-        existing = list((audio.tags or {}).get("covr", []))
+        if audio.tags is None:
+            audio.add_tags()
+        existing = list(audio.tags.get("covr", []))
         album_value = album if replace_album else (bytes(existing[0]) if existing else None)
         track_value = track_art if replace_track else (bytes(existing[1]) if len(existing) > 1 else None)
+        unrelated = [bytes(c) for c in existing[2:]]
         covers = []
         if album_value:
             covers.append(MP4Cover(album_value, imageformat=MP4Cover.FORMAT_JPEG))
         if track_value and track_value != album_value:
             covers.append(MP4Cover(track_value, imageformat=MP4Cover.FORMAT_JPEG))
-        audio["covr"] = covers
+        for extra in unrelated:
+            covers.append(MP4Cover(extra, imageformat=MP4Cover.FORMAT_JPEG))
+        if covers:
+            audio["covr"] = covers
+        elif "covr" in audio:
+            del audio["covr"]
         audio.save()
         return
     raise WriteError(f"unsupported extension for embedding: {suffix}")
 
 
-def apply_track_artwork(track: Track, *, album_raw: bytes | None, track_raw: bytes | None,
-                        replace_album: bool, replace_track: bool,
-                        write_cover_jpg: bool = False, backup_key: int = 0) -> tuple[str, str, bool]:
-    """Apply both roles to one file; automatically restore it on any failure."""
+def _write_tags(path: Path, tags: dict[str, str]) -> None:
+    if not tags:
+        return
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        try:
+            audio = EasyID3(str(path))
+        except ID3NoHeaderError:
+            audio = EasyID3()
+        for k in ("album", "artist", "albumartist"):
+            if k in tags:
+                if tags[k]:
+                    audio[k] = [tags[k]]
+                elif k in audio:
+                    del audio[k]
+        audio.save(str(path))
+    elif suffix == ".flac":
+        audio = FLAC(str(path))
+        for k in ("album", "artist", "albumartist"):
+            if k in tags:
+                if tags[k]:
+                    audio[k] = tags[k]
+                elif k in audio:
+                    del audio[k]
+        audio.save()
+    elif suffix in (".m4a", ".mp4", ".m4b"):
+        try:
+            audio = EasyMP4(str(path))
+        except Exception:
+            raw_mp4 = MP4(str(path))
+            if raw_mp4.tags is None:
+                raw_mp4.add_tags()
+                raw_mp4.save()
+            audio = EasyMP4(str(path))
+        for k in ("album", "artist", "albumartist"):
+            if k in tags:
+                if tags[k]:
+                    audio[k] = [tags[k]]
+                elif k in audio:
+                    del audio[k]
+        audio.save()
+    elif suffix in (".ogg", ".oga", ".opus"):
+        audio = MutagenFile(str(path))
+        if audio is not None and audio.tags is not None:
+            for k in ("album", "artist", "albumartist"):
+                if k in tags:
+                    if tags[k]:
+                        audio.tags[k] = [tags[k]]
+                    elif k in audio.tags:
+                        del audio.tags[k]
+            audio.save()
+    else:
+        raise WriteError(f"unsupported extension for tags: {suffix}")
+
+
+def apply_track_artwork(track: Track, *, album_raw: bytes | None = None, track_raw: bytes | None = None,
+                        replace_album: bool = False, replace_track: bool = False,
+                        write_cover_jpg: bool = False, backup_key: int = 0,
+                        tags: dict[str, str] | None = None) -> tuple[str, str, bool]:
+    """Apply both roles and/or tags to one file; automatically restore it on any failure."""
     path = track_path(track)
     if not path.is_file():
         raise WriteError(f"track file is missing: {track.path}")
@@ -183,7 +249,10 @@ def apply_track_artwork(track: Track, *, album_raw: bytes | None, track_raw: byt
     sidecar_rel = str(Path(track.path).parent / "cover.jpg").replace("\\", "/") if write_cover_jpg else None
     backup = backup_files(backup_key or track.id, [track.path], sidecar_rel=sidecar_rel)
     try:
-        _write_roles(path, album, track_art, replace_album=replace_album, replace_track=replace_track)
+        if album or track_art or replace_album or replace_track:
+            _write_roles(path, album, track_art, replace_album=replace_album, replace_track=replace_track)
+        if tags:
+            _write_tags(path, tags)
         wrote_cover = False
         if sidecar_rel and album:
             (get_settings().music_root / sidecar_rel.lstrip("/")).write_bytes(album)
@@ -193,4 +262,5 @@ def apply_track_artwork(track: Track, *, album_raw: bytes | None, track_raw: byt
         raise
     hashes = ",".join(hashlib.sha256(value).hexdigest() for value in (album, track_art) if value)
     return str(backup), hashes, wrote_cover
+
 

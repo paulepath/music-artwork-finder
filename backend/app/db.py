@@ -42,6 +42,12 @@ _EXPECTED_COLUMNS = {
     "album_groups": {
         "art_hash": "VARCHAR(64)",
         "art_dupe_albums": "INTEGER NOT NULL DEFAULT 0",
+        "merged_into_id": "INTEGER",
+        "merge_dismissed": "BOOLEAN NOT NULL DEFAULT 0",
+        "identified_album": "VARCHAR(512)",
+        "identified_artist": "VARCHAR(512)",
+        "identified_mbid": "VARCHAR(64)",
+        "identified_release_group_id": "VARCHAR(64)",
     },
     "candidates": {
         "group_fingerprint": "VARCHAR(64) NOT NULL DEFAULT ''",
@@ -63,8 +69,67 @@ _EXPECTED_COLUMNS = {
         "search_artist": "VARCHAR(512) NOT NULL DEFAULT ''",
         "search_album": "VARCHAR(512) NOT NULL DEFAULT ''",
         "search_album_artist": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "artwork_role": "VARCHAR(8) NOT NULL DEFAULT 'album'",
     },
 }
+
+
+def _migrate_track_write_audits(conn) -> None:
+    from sqlalchemy import text
+    rows = conn.execute(text("PRAGMA table_info(track_write_audits)")).fetchall()
+    if not rows:
+        return
+    col_map = {row[1]: row for row in rows}
+    # col[3] is notnull: 1 = not null, 0 = nullable
+    if (col_map.get("session_id") and col_map["session_id"][3] == 1) or (
+        col_map.get("target_id") and col_map["target_id"][3] == 1
+    ):
+        conn.execute(
+            text(
+                """
+                CREATE TABLE track_write_audits_new (
+                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER,
+                    target_id INTEGER,
+                    track_id INTEGER NOT NULL,
+                    action VARCHAR(32) NOT NULL,
+                    roles VARCHAR(64) NOT NULL,
+                    backup_dir TEXT NOT NULL,
+                    image_sha256 TEXT NOT NULL DEFAULT '',
+                    wrote_cover_jpg BOOLEAN NOT NULL DEFAULT 0,
+                    ok BOOLEAN NOT NULL DEFAULT 1,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at DATETIME NOT NULL,
+                    undone_at DATETIME,
+                    FOREIGN KEY(session_id) REFERENCES search_sessions (id),
+                    FOREIGN KEY(target_id) REFERENCES search_targets (id),
+                    FOREIGN KEY(track_id) REFERENCES tracks (id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO track_write_audits_new (
+                    id, session_id, target_id, track_id, action, roles,
+                    backup_dir, image_sha256, wrote_cover_jpg, ok, error,
+                    created_at, undone_at
+                )
+                SELECT
+                    id, session_id, target_id, track_id, action, roles,
+                    backup_dir, image_sha256, wrote_cover_jpg, ok, error,
+                    created_at, undone_at
+                FROM track_write_audits
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE track_write_audits"))
+        conn.execute(text("ALTER TABLE track_write_audits_new RENAME TO track_write_audits"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_track_write_audits_created_at ON track_write_audits (created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_track_write_audits_session_id ON track_write_audits (session_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_track_write_audits_track_id ON track_write_audits (track_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_track_write_audits_target_id ON track_write_audits (target_id)"))
 
 
 def _add_missing_columns() -> None:
@@ -75,6 +140,7 @@ def _add_missing_columns() -> None:
             for name, ddl in cols.items():
                 if name not in existing:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        _migrate_track_write_audits(conn)
 
 
 @contextmanager

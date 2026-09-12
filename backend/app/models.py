@@ -94,6 +94,19 @@ class ScanRun(Base):
     note: Mapped[str] = mapped_column(Text, default="")
 
 
+class AlbumMerge(Base):
+    __tablename__ = "album_merges"
+    __table_args__ = (UniqueConstraint("merge_key", name="uq_album_merge_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    merge_key: Mapped[str] = mapped_column(String(512), index=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    album_artist: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    groups: Mapped[list["AlbumGroup"]] = relationship(back_populates="merged_into")
+
+
 class AlbumGroup(Base):
     __tablename__ = "album_groups"
     __table_args__ = (UniqueConstraint("group_key", name="uq_group_key"),)
@@ -107,6 +120,10 @@ class AlbumGroup(Base):
     is_compilation: Mapped[bool] = mapped_column(Boolean, default=False)
     musicbrainz_albumid: Mapped[Optional[str]] = mapped_column(String(64))
     musicbrainz_releasegroupid: Mapped[Optional[str]] = mapped_column(String(64))
+    identified_album: Mapped[Optional[str]] = mapped_column(String(512))
+    identified_artist: Mapped[Optional[str]] = mapped_column(String(512))
+    identified_mbid: Mapped[Optional[str]] = mapped_column(String(64))
+    identified_release_group_id: Mapped[Optional[str]] = mapped_column(String(64))
 
     common_dir: Mapped[str] = mapped_column(Text, default="")
     track_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -115,6 +132,9 @@ class AlbumGroup(Base):
     art_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)   # sha1 of current embedded cover
     art_dupe_albums: Mapped[int] = mapped_column(Integer, default=0)          # # other distinct albums sharing it
 
+    merged_into_id: Mapped[Optional[int]] = mapped_column(ForeignKey("album_merges.id"))
+    merge_dismissed: Mapped[bool] = mapped_column(Boolean, default=False)
+
     state: Mapped[GroupState] = mapped_column(Enum(GroupState), default=GroupState.scanned, index=True)
     google_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     last_seen_scan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("scan_runs.id"))
@@ -122,6 +142,7 @@ class AlbumGroup(Base):
 
     tracks: Mapped[list["Track"]] = relationship(back_populates="group", cascade="all, delete-orphan")
     candidates: Mapped[list["Candidate"]] = relationship(back_populates="group", cascade="all, delete-orphan")
+    merged_into: Mapped[Optional[AlbumMerge]] = relationship(back_populates="groups")
 
 
 class Track(Base):
@@ -262,6 +283,7 @@ class SearchTarget(Base):
     track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
     track_query_id: Mapped[int] = mapped_column(ForeignKey("artwork_queries.id"))
     album_query_id: Mapped[int] = mapped_column(ForeignKey("artwork_queries.id"))
+    artwork_role: Mapped[QueryRole] = mapped_column(Enum(QueryRole), default=QueryRole.album)
     status: Mapped[WorkStatus] = mapped_column(Enum(WorkStatus), default=WorkStatus.queued, index=True)
     stage: Mapped[str] = mapped_column(String(64), default="queued")
     progress: Mapped[float] = mapped_column(Float, default=0.0)
@@ -327,8 +349,8 @@ class TrackWriteAudit(Base):
     __tablename__ = "track_write_audits"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("search_sessions.id"), index=True)
-    target_id: Mapped[int] = mapped_column(ForeignKey("search_targets.id"), index=True)
+    session_id: Mapped[Optional[int]] = mapped_column(ForeignKey("search_sessions.id"), nullable=True, index=True)
+    target_id: Mapped[Optional[int]] = mapped_column(ForeignKey("search_targets.id"), nullable=True, index=True)
     track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
     action: Mapped[str] = mapped_column(String(32), default="apply")
     roles: Mapped[str] = mapped_column(String(64), default="")

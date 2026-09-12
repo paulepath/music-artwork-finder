@@ -1,4 +1,4 @@
-# Music Artwork Finder
+# artwork-recovery
 
 Track-first web app for finding and repairing artwork in a local music library. Select
 one or more tracks, or browse to a folder and include it recursively, then watch a
@@ -17,21 +17,18 @@ M4A, preserve unrelated pictures, create recoverable backups, and are recorded i
 audit log. M4A files store album art first and track art second in `covr`. A successful
 apply also queues a Music Assistant library refresh when its token is configured.
 
+Full background / spec: `../CLAUDE_HANDOFF.md`.
+
 ## Layout
 
 ```
 backend/    FastAPI + SQLite + Mutagen + Playwright
 frontend/   React + Vite SPA (built into backend/app/static at image build time)
 Dockerfile  multi-stage: node build -> playwright-python runtime
-docker-compose.yml  standalone compose definition
-deploy/     NAS/Portainer compose definition
 ```
 
-## Running with Docker
-
-```bash
-docker compose up -d
-```
+The production compose definition is in `deploy/artwork-recovery.compose.yml`
+(Portainer, Synology NAS endpoint ID 2).
 
 ## Workflow
 
