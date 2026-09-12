@@ -1,0 +1,23 @@
+services:
+  artwork-finder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: paulepath/music-artwork-finder:latest
+    container_name: music-artwork-finder
+    environment:
+      TZ: Europe/London
+      PUID: "1000"
+      PGID: "1000"
+      MUSIC_ROOT: /music
+      ARTWORK_DATA_DIR: /config
+      MA_WS_URL: ws://192.168.0.120:8095/ws
+      # Optional Plex read-only integration:
+      # PLEX_URL: http://192.168.1.50:32400
+      # PLEX_PATH_MAPS: /music=/volume4/music
+    volumes:
+      - /path/to/music:/music:rw
+      - ./config:/config
+    ports:
+      - "8093:8000"
+    restart: unless-stopped
