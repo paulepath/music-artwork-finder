@@ -1,0 +1,19 @@
+services:
+  artwork-recovery:
+    image: local/artwork-recovery:v2
+    container_name: artwork-recovery
+    restart: unless-stopped
+    environment:
+      PUID: "1026"
+      PGID: "100"
+      TZ: Europe/London
+      MUSIC_ROOT: /music
+      ARTWORK_DATA_DIR: /config
+      MA_WS_URL: ws://192.168.0.120:8095/ws
+      PLEX_URL: http://192.168.1.50:32400
+      PLEX_PATH_MAPS: /music=/volume4/music
+    volumes:
+      - /volume4/music:/music
+      - /volume1/docker/artwork-recovery/config:/config
+    ports:
+      - "8093:8000"

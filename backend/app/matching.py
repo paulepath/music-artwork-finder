@@ -108,6 +108,16 @@ class GroupMeta:
 
 
 @dataclass
+class TrackMeta:
+    """Metadata used to find a single/track release image."""
+    title: str
+    artist: str
+    album: str = ""
+    year: int | None = None
+    musicbrainz_trackid: str | None = None
+
+
+@dataclass
 class TierResult:
     tier: Tier
     confidence: float
@@ -152,10 +162,15 @@ def classify(group: GroupMeta, rel: ReleaseMeta) -> TierResult:
                           f"(title~{title_sim:.2f}, artist~{artist_sim:.2f}) — review manually")
 
     # --- strong: names + track count + year all line up -------------------
+    # NOTE: do not bypass artist checking just because the *local* file is
+    # tagged Various Artists — that describes nearly every track in a VA
+    # compilation library and would let any title-only match through
+    # regardless of who the candidate release is actually by. Only trust a
+    # VA/compiler-name mismatch when the *candidate* also looks like a VA
+    # compilation (both sides agree it's a compilation, not just ours).
     artist_ok = (
         token_similarity(g_artist, r_artist) >= 0.6
         or (group.is_compilation and is_various_artists(rel.artist))
-        or is_various_artists(group.album_artist)
     )
     tc_ok = (
         rel.track_count is not None
@@ -187,3 +202,28 @@ def classify(group: GroupMeta, rel: ReleaseMeta) -> TierResult:
         parts.append("year differs")
     conf = 0.4 * title_sim + (0.2 if artist_ok else 0) + (0.2 if tc_ok else 0)
     return TierResult(Tier.fuzzy, round(conf, 3), "; ".join(parts))
+
+
+def classify_track(track: TrackMeta, *, title: str, artist: str,
+                   exact_identifier: bool = False) -> TierResult:
+    """Score a provider's track hit without silently accepting a title collision."""
+    local_title, remote_title = normalize(track.title), normalize(title)
+    local_artist, remote_artist = normalize(track.artist), normalize(artist)
+    title_sim = token_similarity(local_title, remote_title)
+    artist_sim = token_similarity(local_artist, remote_artist)
+    if exact_identifier and title_sim >= 0.6:
+        return TierResult(Tier.exact, 1.0, "MusicBrainz track identifier matches")
+    if title_sim < 0.5:
+        return TierResult(Tier.fuzzy, title_sim,
+                          f"track title too different ('{title}' vs '{track.title}')",
+                          rejected=True)
+    if local_artist and artist_sim < 0.34:
+        return TierResult(Tier.fuzzy, artist_sim,
+                          f"track artist differs ('{artist}' vs '{track.artist}')",
+                          rejected=True)
+    if title_sim >= 0.85 and (not local_artist or artist_sim >= 0.6):
+        return TierResult(Tier.strong, min(0.99, 0.75 + 0.15 * title_sim + 0.1 * artist_sim),
+                          "track title and artist match")
+    confidence = round(0.65 * title_sim + 0.35 * artist_sim, 3)
+    return TierResult(Tier.fuzzy, confidence,
+                      f"track title~{title_sim:.2f}; artist~{artist_sim:.2f}")

@@ -31,9 +31,6 @@ export function Dashboard() {
       <div className="card">
         <div className="row">
           <button className="primary" onClick={run(api.startScan)}>Rescan library</button>
-          <button onClick={run(api.findAll)}>Find artwork (trusted sources)</button>
-          <button onClick={run(api.findSuspect)}>Re-check suspect artwork</button>
-          <button onClick={run(api.applyExact)}>Apply all exact matches</button>
           <button onClick={run(api.maSync)}>Trigger Music Assistant sync</button>
           <div className="spacer" />
           <span className="muted">{stats?.active_jobs ?? 0} active job(s)</span>

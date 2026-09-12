@@ -1,13 +1,21 @@
 # Music Artwork Finder
 
-Web app that finds missing album/track artwork for a local music library and embeds it
-into audio file tags (front-cover `APIC` / `METADATA_BLOCK_PICTURE`) so **Music Assistant** and other media players display it.
+Track-first web app for finding and repairing artwork in a local music library. Select
+one or more tracks, or browse to a folder and include it recursively, then watch a
+durable background search session update in the browser.
 
 Trusted metadata sources are tried first (MusicBrainz + Cover Art Archive, iTunes,
-Deezer). A headless Google Images scrape is a **manually-approved last resort** — its
-results are clustered by perceptual hash so a human can pick the consensus cover in the
-web UI. Nothing fuzzy is ever written without explicit per-album approval, and every
-write is backed up and undoable.
+Deezer, and optional Plex). Google Images is used automatically when those sources do
+not produce a high-confidence result. Exact and near-identical images are grouped by
+perceptual hash; agreement from independent sources raises the result's score, while
+repeated Google results have capped influence.
+
+Every track shows its current embedded artwork and separate candidate groups for album
+art and track/single artwork. The best choices are preselected, but **nothing is written
+until it is explicitly approved and applied**. Writes support MP3, FLAC, Ogg/Opus and
+M4A, preserve unrelated pictures, create recoverable backups, and are recorded in the
+audit log. M4A files store album art first and track art second in `covr`. A successful
+apply also queues a Music Assistant library refresh when its token is configured.
 
 ## Layout
 
@@ -15,7 +23,8 @@ write is backed up and undoable.
 backend/    FastAPI + SQLite + Mutagen + Playwright
 frontend/   React + Vite SPA (built into backend/app/static at image build time)
 Dockerfile  multi-stage: node build -> playwright-python runtime
-docker-compose.yml  ready-to-run compose definition
+docker-compose.yml  standalone compose definition
+deploy/     NAS/Portainer compose definition
 ```
 
 ## Running with Docker
@@ -23,6 +32,18 @@ docker-compose.yml  ready-to-run compose definition
 ```bash
 docker compose up -d
 ```
+
+## Workflow
+
+1. Run **Rescan library** from Maintenance after adding or retagging music.
+2. Open **Find artwork**, search/filter tracks or choose a folder, and start a session.
+3. Review grouped album and track/single candidates while the search progresses.
+4. Approve individual choices, or approve all recommended high/medium-confidence
+   choices, then apply them.
+
+Folders larger than 100 tracks require confirmation. Search sessions can be paused,
+resumed, cancelled, and retried. `cover.jpg` is updated only when a complete selected
+folder agrees on one approved album image.
 
 ## Local dev
 

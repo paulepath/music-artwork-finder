@@ -27,6 +27,6 @@ class Source(Protocol):
         ...
 
 
-# Order matters: earlier = more trusted. Google is deliberately NOT here; it is
-# only ever run on explicit per-album opt-in via google_images.GoogleImagesSource.
+# Order matters: earlier = more trusted. Google is deliberately not in this
+# trusted list; search sessions invoke it as a lower-weight fallback.
 TRUSTED_SOURCES = ("musicbrainz", "itunes", "deezer")

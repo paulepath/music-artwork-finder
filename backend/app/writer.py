@@ -113,14 +113,18 @@ def _embed_one(path: Path, jpeg: bytes) -> None:
     if suffix == ".mp3":
         try:
             tags = ID3(path)
-            orig_minor = tags.version[1]
         except ID3NoHeaderError:
             tags = ID3()
-            orig_minor = 4
         tags.delall("APIC")
         tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=jpeg))
-        # preserve the file's existing ID3 sub-version so v2.4-only frames survive
-        tags.save(path, v2_version=4 if orig_minor >= 4 else 3)
+        # Always downgrade to ID3v2.3: classic Windows Media Player / Explorer's
+        # shell thumbnail handler cannot parse ID3v2.4 frame headers and show no
+        # art at all for v2.4 files, even though the tag is spec-valid. v2.3 is
+        # universally readable (Windows, MA, everything else) and update_to_v23()
+        # must be called before save(v2_version=3) or frame encodings/dates are
+        # left in v2.4-only form.
+        tags.update_to_v23()
+        tags.save(path, v2_version=3)
     elif suffix == ".flac":
         audio = FLAC(path)
         audio.clear_pictures()

@@ -53,6 +53,11 @@ def _album_base(title: str) -> str:
     return " ".join(out)
 
 
+def album_base(title: str) -> str:
+    """Public disc-marker normalizer used by track-first album queries."""
+    return _album_base(title)
+
+
 def group_key(album_artist: str, album: str, disc: int, directory: str = "") -> str:
     """Stable key for one on-disk album directory.
 

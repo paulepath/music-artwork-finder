@@ -302,16 +302,39 @@ def run_scan(progress_cb=None) -> int:
 
 
 def _replace_tracks(db, row: AlbumGroup, g: Group) -> None:
-    # A directory-aware regroup can move a path from a legacy, tag-only group
-    # into a new safe group.  ``tracks.path`` is globally unique, so release it
-    # from any obsolete group before inserting the current scan's ownership.
+    # Track ids are stable because v2 search/audit rows reference them.  Move and
+    # update an existing path instead of the legacy delete-and-reinsert strategy.
+    from .models import SearchTarget, TrackWriteAudit
     paths = [t.path for t in g.tracks]
-    if paths:
-        db.query(Track).filter(Track.path.in_(paths)).delete(synchronize_session=False)
-    db.query(Track).filter_by(group_id=row.id).delete()
     for t in g.tracks:
-        db.add(Track(
-            group_id=row.id, path=t.path, title=t.title, track_no=t.track_no,
-            duration_s=t.duration_s, has_embedded_art=t.has_embedded_art,
-            musicbrainz_trackid=t.musicbrainz_trackid,
-        ))
+        real = get_settings().music_root / t.path.lstrip("/")
+        try:
+            stat = real.stat()
+            file_size, mtime_ns = stat.st_size, stat.st_mtime_ns
+        except OSError:
+            file_size, mtime_ns = 0, 0
+        track = db.query(Track).filter_by(path=t.path).one_or_none()
+        if track is None:
+            track = Track(path=t.path)
+            db.add(track)
+        track.group_id = row.id
+        track.title, track.artist = t.title, t.artist
+        track.album = t.album
+        track.album_artist = t.album_artist or t.effective_album_artist
+        track.disc, track.year = t.disc, t.year
+        track.file_format = real.suffix.lower().lstrip(".")
+        track.file_size, track.mtime_ns = file_size, mtime_ns
+        track.track_no, track.duration_s = t.track_no, t.duration_s
+        track.has_embedded_art = t.has_embedded_art
+        track.musicbrainz_trackid = t.musicbrainz_trackid
+
+    stale = db.query(Track).filter(Track.group_id == row.id)
+    if paths:
+        stale = stale.filter(~Track.path.in_(paths))
+    for track in stale:
+        referenced = (
+            db.query(SearchTarget.id).filter_by(track_id=track.id).first()
+            or db.query(TrackWriteAudit.id).filter_by(track_id=track.id).first()
+        )
+        if not referenced:
+            db.delete(track)

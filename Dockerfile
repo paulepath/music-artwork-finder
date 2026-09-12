@@ -4,8 +4,7 @@
 FROM node:20-bookworm-slim AS frontend
 WORKDIR /fe
 COPY frontend/package.json frontend/package-lock.json* ./
-# The repository currently has no lockfile.  Prefer deterministic npm ci as
-# soon as one is committed, while retaining a buildable first checkout.
+# Use the lockfile for deterministic frontend dependency installation.
 RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 COPY frontend/ ./
 # tsc typecheck + build; override vite outDir (config points at ../backend for local dev)

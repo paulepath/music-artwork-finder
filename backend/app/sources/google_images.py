@@ -39,6 +39,10 @@ class GoogleImagesSource:
 
     async def find(self, client, group: GroupMeta) -> list[CandidateData]:  # noqa: ARG002
         query = _build_query(group)
+        return await self.find_text(client, query, title=group.album, artist=group.album_artist)
+
+    async def find_text(self, client, query: str, *, title: str, artist: str) -> list[CandidateData]:  # noqa: ARG002
+        """Search an explicit, already-sanitised album or track query."""
         html = await self._fetch_html(query)
         if not html:
             return []
@@ -57,8 +61,7 @@ class GoogleImagesSource:
                 image_url=url,
                 provenance_url=f"https://www.google.com/search?tbm=isch&q={quote_plus(query)}",
                 width=w, height=h,
-                release=ReleaseMeta(source="google", title=group.album,
-                                    artist=group.album_artist),
+                release=ReleaseMeta(source="google", title=title, artist=artist),
                 extra={"query": query},
             ))
             if len(out) >= self.max_results:

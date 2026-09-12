@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ORM(BaseModel):
@@ -17,6 +17,16 @@ class TrackOut(ORM):
     track_no: int | None
     duration_s: float | None
     has_embedded_art: bool
+
+
+class LibraryTrackOut(TrackOut):
+    artist: str = ""
+    album: str = ""
+    album_artist: str = ""
+    disc: int = 1
+    year: int | None = None
+    file_format: str = ""
+    file_size: int = 0
 
 
 class CandidateOut(ORM):
@@ -100,3 +110,32 @@ class StatsOut(BaseModel):
     missing_art: int
     last_scan: dt.datetime | None
     active_jobs: int
+
+
+class SearchMetadataOverride(BaseModel):
+    track_id: int
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    album_artist: str = ""
+    year: int | None = None
+
+
+class SearchSelectionRequest(BaseModel):
+    track_ids: list[int] = Field(default_factory=list)
+    folder_path: str | None = None
+    recursive: bool = True
+    include_existing: bool = True
+    confirm_large: bool = False
+    overrides: list[SearchMetadataOverride] = Field(default_factory=list)
+
+
+class SelectionUpdate(BaseModel):
+    album_cluster_id: int | None = None
+    track_cluster_id: int | None = None
+    album_approved: bool = False
+    track_approved: bool = False
+
+
+class ApproveRecommendedRequest(BaseModel):
+    minimum_confidence: str = "medium"

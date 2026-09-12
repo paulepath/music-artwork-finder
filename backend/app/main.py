@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
 from .db import init_db
-from .routers import albums, audit, candidates, ma, scan
+from .routers import albums, audit, candidates, ma, scan, search
 from .worker import worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -31,7 +31,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="artwork-recovery", version="0.1.0", lifespan=lifespan)
 
-for r in (scan.router, albums.router, audit.router, candidates.router, ma.router):
+for r in (scan.router, albums.router, audit.router, candidates.router, ma.router, search.router):
     app.include_router(r)
 
 

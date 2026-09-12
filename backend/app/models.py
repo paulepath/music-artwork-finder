@@ -45,12 +45,39 @@ class JobKind(str, enum.Enum):
     google_search = "google_search"
     apply = "apply"
     ma_sync = "ma_sync"
+    search_session = "search_session"
+    apply_session = "apply_session"
 
 
 class JobStatus(str, enum.Enum):
     queued = "queued"
     running = "running"
     done = "done"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class SearchStatus(str, enum.Enum):
+    queued = "queued"
+    running = "running"
+    paused = "paused"
+    review_ready = "review_ready"
+    applying = "applying"
+    done = "done"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class QueryRole(str, enum.Enum):
+    album = "album"
+    track = "track"
+
+
+class WorkStatus(str, enum.Enum):
+    queued = "queued"
+    running = "running"
+    ready = "ready"
+    applied = "applied"
     failed = "failed"
     cancelled = "cancelled"
 
@@ -105,6 +132,14 @@ class Track(Base):
     group_id: Mapped[int] = mapped_column(ForeignKey("album_groups.id"), index=True)
     path: Mapped[str] = mapped_column(Text)
     title: Mapped[str] = mapped_column(String(512), default="")
+    artist: Mapped[str] = mapped_column(String(512), default="")
+    album: Mapped[str] = mapped_column(String(512), default="")
+    album_artist: Mapped[str] = mapped_column(String(512), default="")
+    disc: Mapped[int] = mapped_column(Integer, default=1)
+    year: Mapped[Optional[int]] = mapped_column(Integer)
+    file_format: Mapped[str] = mapped_column(String(16), default="")
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    mtime_ns: Mapped[int] = mapped_column(Integer, default=0)
     track_no: Mapped[Optional[int]] = mapped_column(Integer)
     duration_s: Mapped[Optional[float]] = mapped_column(Float)
     has_embedded_art: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -171,5 +206,136 @@ class AuditEntry(Base):
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
     error: Mapped[str] = mapped_column(Text, default="")
     detail: Mapped[str] = mapped_column(Text, default="{}")   # JSON: before/after summary
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    undone_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class SearchSession(Base):
+    __tablename__ = "search_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[SearchStatus] = mapped_column(Enum(SearchStatus), default=SearchStatus.queued, index=True)
+    selection_kind: Mapped[str] = mapped_column(String(16), default="tracks")
+    folder_path: Mapped[str] = mapped_column(Text, default="")
+    recursive: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_existing: Mapped[bool] = mapped_column(Boolean, default=True)
+    confirmed_large: Mapped[bool] = mapped_column(Boolean, default=False)
+    total_tracks: Mapped[int] = mapped_column(Integer, default=0)
+    completed_tracks: Mapped[int] = mapped_column(Integer, default=0)
+    failed_tracks: Mapped[int] = mapped_column(Integer, default=0)
+    progress: Mapped[float] = mapped_column(Float, default=0.0)
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class ArtworkQuery(Base):
+    __tablename__ = "artwork_queries"
+    __table_args__ = (UniqueConstraint("session_id", "role", "query_key", name="uq_session_query"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("search_sessions.id"), index=True)
+    role: Mapped[QueryRole] = mapped_column(Enum(QueryRole), index=True)
+    query_key: Mapped[str] = mapped_column(String(1024))
+    artist: Mapped[str] = mapped_column(String(512), default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    album: Mapped[str] = mapped_column(String(512), default="")
+    album_artist: Mapped[str] = mapped_column(String(512), default="")
+    year: Mapped[Optional[int]] = mapped_column(Integer)
+    musicbrainz_id: Mapped[Optional[str]] = mapped_column(String(64))
+    release_group_id: Mapped[Optional[str]] = mapped_column(String(64))
+    status: Mapped[WorkStatus] = mapped_column(Enum(WorkStatus), default=WorkStatus.queued, index=True)
+    progress: Mapped[float] = mapped_column(Float, default=0.0)
+    message: Mapped[str] = mapped_column(Text, default="")
+    google_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class SearchTarget(Base):
+    __tablename__ = "search_targets"
+    __table_args__ = (UniqueConstraint("session_id", "track_id", name="uq_session_track"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("search_sessions.id"), index=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
+    track_query_id: Mapped[int] = mapped_column(ForeignKey("artwork_queries.id"))
+    album_query_id: Mapped[int] = mapped_column(ForeignKey("artwork_queries.id"))
+    status: Mapped[WorkStatus] = mapped_column(Enum(WorkStatus), default=WorkStatus.queued, index=True)
+    stage: Mapped[str] = mapped_column(String(64), default="queued")
+    progress: Mapped[float] = mapped_column(Float, default=0.0)
+    message: Mapped[str] = mapped_column(Text, default="")
+    fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    search_title: Mapped[str] = mapped_column(String(512), default="")
+    search_artist: Mapped[str] = mapped_column(String(512), default="")
+    search_album: Mapped[str] = mapped_column(String(512), default="")
+    search_album_artist: Mapped[str] = mapped_column(String(512), default="")
+    selected_album_cluster_id: Mapped[Optional[int]] = mapped_column(ForeignKey("artwork_clusters.id"))
+    selected_track_cluster_id: Mapped[Optional[int]] = mapped_column(ForeignKey("artwork_clusters.id"))
+    album_approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    track_approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
+class ArtworkAsset(Base):
+    __tablename__ = "artwork_assets"
+    __table_args__ = (UniqueConstraint("sha256", name="uq_artwork_asset_sha"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    phash: Mapped[str] = mapped_column(String(32), index=True)
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    mime_type: Mapped[str] = mapped_column(String(64), default="image/jpeg")
+    cache_path: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtworkCluster(Base):
+    __tablename__ = "artwork_clusters"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    query_id: Mapped[int] = mapped_column(ForeignKey("artwork_queries.id"), index=True)
+    representative_asset_id: Mapped[int] = mapped_column(ForeignKey("artwork_assets.id"))
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_label: Mapped[str] = mapped_column(String(16), default="low")
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    observation_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class CandidateObservation(Base):
+    __tablename__ = "candidate_observations"
+    __table_args__ = (UniqueConstraint("query_id", "source", "image_url", name="uq_query_source_url"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    query_id: Mapped[int] = mapped_column(ForeignKey("artwork_queries.id"), index=True)
+    cluster_id: Mapped[Optional[int]] = mapped_column(ForeignKey("artwork_clusters.id"), index=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("artwork_assets.id"))
+    source: Mapped[str] = mapped_column(String(64))
+    image_url: Mapped[str] = mapped_column(Text)
+    provenance_url: Mapped[str] = mapped_column(Text, default="")
+    source_host: Mapped[str] = mapped_column(String(255), default="")
+    metadata_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    evidence_kind: Mapped[str] = mapped_column(String(32), default="search")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TrackWriteAudit(Base):
+    __tablename__ = "track_write_audits"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("search_sessions.id"), index=True)
+    target_id: Mapped[int] = mapped_column(ForeignKey("search_targets.id"), index=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
+    action: Mapped[str] = mapped_column(String(32), default="apply")
+    roles: Mapped[str] = mapped_column(String(64), default="")
+    backup_dir: Mapped[str] = mapped_column(Text, default="")
+    image_sha256: Mapped[str] = mapped_column(Text, default="")
+    wrote_cover_jpg: Mapped[bool] = mapped_column(Boolean, default=False)
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     undone_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import asyncio
 from urllib.parse import urlsplit
 
 import httpx
@@ -10,17 +11,19 @@ from .config import get_settings
 
 _settings = get_settings()
 _last_hit: dict[str, float] = {}
+_locks: dict[str, asyncio.Lock] = {}
 
 
 async def _throttle(url: str) -> None:
     host = urlsplit(url).hostname or "_default"
-    gap = _settings.rate_limits.get(host, _settings.rate_limits.get("_default", 0.25))
-    now = time.monotonic()
-    wait = gap - (now - _last_hit.get(host, 0.0))
-    if wait > 0:
-        import asyncio
-        await asyncio.sleep(wait)
-    _last_hit[host] = time.monotonic()
+    lock = _locks.setdefault(host, asyncio.Lock())
+    async with lock:
+        gap = _settings.rate_limits.get(host, _settings.rate_limits.get("_default", 0.25))
+        now = time.monotonic()
+        wait = gap - (now - _last_hit.get(host, 0.0))
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_hit[host] = time.monotonic()
 
 
 def new_client() -> httpx.AsyncClient:

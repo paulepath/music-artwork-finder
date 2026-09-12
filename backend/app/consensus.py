@@ -66,35 +66,30 @@ async def fetch_and_hash(
                         cache_path=str(cache_path))
 
 
-def _hamming(a: str, b: str) -> int:
+def hamming_distance(a: str, b: str) -> int:
     return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
 
 
 def cluster_phashes(phashes: list[str | None], threshold: int = CLUSTER_THRESHOLD) -> list[int]:
-    """Union-find clustering. Returns a cluster id per input (``-1`` for missing hash)."""
-    n = len(phashes)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> None:
-        parent[find(x)] = find(y)
-
-    for i in range(n):
-        if phashes[i] is None:
+    """Representative-based clustering; avoids A~B~C transitive false merges."""
+    representatives: list[str] = []
+    raw: list[int] = []
+    for value in phashes:
+        if value is None:
+            raw.append(-1)
             continue
-        for j in range(i + 1, n):
-            if phashes[j] is None:
-                continue
-            if _hamming(phashes[i], phashes[j]) <= threshold:
-                union(i, j)
+        matches = [
+            (hamming_distance(value, representative), index)
+            for index, representative in enumerate(representatives)
+            if hamming_distance(value, representative) <= threshold
+        ]
+        if matches:
+            raw.append(min(matches)[1])
+        else:
+            raw.append(len(representatives))
+            representatives.append(value)
 
-    # normalise ids to 0..k, ordered by descending cluster size
-    raw = [find(i) if phashes[i] is not None else -1 for i in range(n)]
+    # Normalise ids to 0..k, ordered by descending cluster size.
     sizes: dict[int, int] = {}
     for r in raw:
         if r >= 0:

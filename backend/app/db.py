@@ -46,6 +46,24 @@ _EXPECTED_COLUMNS = {
     "candidates": {
         "group_fingerprint": "VARCHAR(64) NOT NULL DEFAULT ''",
     },
+    "tracks": {
+        "artist": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "album": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "album_artist": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "disc": "INTEGER NOT NULL DEFAULT 1",
+        "year": "INTEGER",
+        "file_format": "VARCHAR(16) NOT NULL DEFAULT ''",
+        "file_size": "INTEGER NOT NULL DEFAULT 0",
+        "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+    },
+    # These overrides were added after the first v2 development database was
+    # created. Keeping them here also makes interrupted/partial upgrades safe.
+    "search_targets": {
+        "search_title": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "search_artist": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "search_album": "VARCHAR(512) NOT NULL DEFAULT ''",
+        "search_album_artist": "VARCHAR(512) NOT NULL DEFAULT ''",
+    },
 }
 
 
